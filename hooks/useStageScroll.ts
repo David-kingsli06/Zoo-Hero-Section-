@@ -1,8 +1,10 @@
-﻿"use client";
+"use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { STAGES, StageConfig } from "@/stages";
-import { getFrameUrl, loadFrameImage, renderFrameToCanvas } from "@/lib/frameRenderer";
+import { getFrameUrl, renderFrameToCanvas } from "@/lib/frameRenderer";
+import { createFrameStore, getDecodeWindowSize } from "@/lib/frameStore";
+import { useReducedMotion } from "@/lib/useReducedMotion";
 
 export interface UseStageScrollOptions {
   stages?: StageConfig[];
@@ -19,10 +21,9 @@ export function useStageScroll({
   const [scrollProgress, setScrollProgress] = useState(0); // 0.0 to 1.0 overall progress
   const [isStage1Loaded, setIsStage1Loaded] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(0); // 0 to 100 for stage 1
-  const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
+  const prefersReducedMotion = useReducedMotion();
 
-  // Cached decoded HTMLImageElements: framesCache.current[stageIndex][frameIdx0to189]
-  const framesCache = useRef<(HTMLImageElement | null)[][]>([]);
+  const storeRef = useRef<ReturnType<typeof createFrameStore> | null>(null);
 
   // Smooth scroll lerp (linear interpolation) physics
   // targetProgress: where user has scrolled to
@@ -36,126 +37,51 @@ export function useStageScroll({
   const isLoopRunning = useRef<boolean>(false);
 
   const totalStages = stages.length;
-  // Total virtual frame units across all 3 sequences (190 * 3 = 570 frames)
-  const totalFramesCount = stages.reduce((acc, s) => acc + s.frameCount, 0);
 
-  // Initialize frame cache arrays
-  useEffect(() => {
-    framesCache.current = stages.map((s) => new Array(s.frameCount).fill(null));
-  }, [stages]);
-
-  // Accessibility: prefers-reduced-motion check
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    setPrefersReducedMotion(mq.matches);
-    const handler = (e: MediaQueryListEvent) => setPrefersReducedMotion(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
-
-  // Frame renderer helper
-  const drawFrame = useCallback(
-    (stageIdx: number, frameNumber: number) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-
-      const stageFrames = framesCache.current[stageIdx];
-      const maxFrames = stages[stageIdx]?.frameCount || 190;
-      const clampedFrame = Math.max(1, Math.min(maxFrames, Math.round(frameNumber)));
-      let img = stageFrames?.[clampedFrame - 1];
-
-      // Fallback: If image hasn't finished preloading into cache, load it immediately on demand
-      if (!img) {
-        const url = getFrameUrl(stages[stageIdx].folderPath, clampedFrame);
-        img = new Image();
-        img.src = url;
-        if (stageFrames) {
-          stageFrames[clampedFrame - 1] = img;
-        }
-      }
-
-      if (img.complete && img.naturalWidth > 0) {
-        renderFrameToCanvas(canvas, ctx, img);
-        activeStageRef.current = stageIdx;
-        activeFrameRef.current = clampedFrame;
-      } else {
-        img.onload = () => {
-          if (canvasRef.current) {
-            const currentCtx = canvasRef.current.getContext("2d");
-            if (currentCtx) {
-              renderFrameToCanvas(canvasRef.current, currentCtx, img!);
-              activeStageRef.current = stageIdx;
-              activeFrameRef.current = clampedFrame;
-            }
-          }
-        };
-      }
-    },
-    [canvasRef, stages]
+  // Position of a stage's frame in the single, global frame list (1-based frame numbers)
+  const globalIndex = useCallback(
+    (stageIdx: number, frameNumber: number) =>
+      stages.slice(0, stageIdx).reduce((sum, st) => sum + st.frameCount, 0) + frameNumber - 1,
+    [stages]
   );
 
-  // Preload: Stage 1 loaded eagerly with progress, Stages 2 & 3 loaded in background
+  // Frame renderer helper: draws the closest decoded frame of the same stage
+  const drawFrame = useCallback(
+    (stageIdx: number, frameNumber: number) => {
+      activeStageRef.current = stageIdx;
+      activeFrameRef.current = frameNumber;
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      const store = storeRef.current;
+      if (!canvas || !ctx || !store) return;
+      const index = globalIndex(stageIdx, frameNumber);
+      store.setPlayhead(index);
+      const frame = store.getNearest(index);
+      if (frame) renderFrameToCanvas(canvas, ctx, frame.bitmap);
+    },
+    [canvasRef, globalIndex]
+  );
+
+  // Download every frame once; keep only the frames near the playhead decoded
   useEffect(() => {
-    let isCancelled = false;
-    const stage1 = stages[0];
-    const totalStage1 = stage1.frameCount;
-    let loadedCount = 0;
-
-    async function preloadAll() {
-      // 1. Stage 1
-      const stage1Promises: Promise<void>[] = [];
-      for (let i = 1; i <= totalStage1; i++) {
-        const url = getFrameUrl(stage1.folderPath, i);
-        const p = loadFrameImage(url).then((img) => {
-          if (isCancelled) return;
-          if (framesCache.current[0]) {
-            framesCache.current[0][i - 1] = img;
-          }
-          loadedCount++;
-          if (loadedCount % 10 === 0 || loadedCount === totalStage1) {
-            setLoadingProgress(Math.round((loadedCount / totalStage1) * 100));
-          }
-        });
-        stage1Promises.push(p);
-      }
-
-      await Promise.all(stage1Promises);
-      if (isCancelled) return;
-
-      setIsStage1Loaded(true);
-
-      // Draw initial frame 1 of stage 1
-      if (canvasRef.current && framesCache.current[0]?.[0]) {
-        const ctx = canvasRef.current.getContext("2d");
-        if (ctx) {
-          renderFrameToCanvas(canvasRef.current, ctx, framesCache.current[0][0]!);
-        }
-      }
-
-      // 2. Preload remaining stages in background
-      for (let sIdx = 1; sIdx < stages.length; sIdx++) {
-        const st = stages[sIdx];
-        for (let i = 1; i <= st.frameCount; i++) {
-          if (isCancelled) return;
-          const url = getFrameUrl(st.folderPath, i);
-          loadFrameImage(url).then((img) => {
-            if (isCancelled) return;
-            if (framesCache.current[sIdx]) {
-              framesCache.current[sIdx][i - 1] = img;
-            }
-          });
-        }
-      }
-    }
-
-    preloadAll();
-
+    const store = createFrameStore({
+      scenes: stages.map((s) => ({ folder: s.folderPath, frameCount: s.frameCount })),
+      getUrl: getFrameUrl,
+      windowSize: getDecodeWindowSize(),
+      onDecoded: () => drawFrame(activeStageRef.current, activeFrameRef.current),
+      onProgress: (percent, ready) => {
+        setLoadingProgress(percent);
+        if (ready) setIsStage1Loaded(true);
+      },
+    });
+    storeRef.current = store;
+    store.setPlayhead(globalIndex(activeStageRef.current, activeFrameRef.current));
+    store.start();
     return () => {
-      isCancelled = true;
+      store.destroy();
+      storeRef.current = null;
     };
-  }, [stages, canvasRef]);
+  }, [stages, drawFrame, globalIndex]);
 
   // Map continuous progress [0.0, 1.0] to { stageIndex, frameNumber }
   const getStageAndFrameFromProgress = useCallback(
@@ -239,12 +165,15 @@ export function useStageScroll({
     };
 
     window.addEventListener("scroll", handleScroll, { passive: true });
-    // Run immediately to paint initial frame
-    handleScroll();
+    // Paint the position the page opened at
+    const first = requestAnimationFrame(handleScroll);
 
     return () => {
+      cancelAnimationFrame(first);
       window.removeEventListener("scroll", handleScroll);
       if (rAFRef.current) cancelAnimationFrame(rAFRef.current);
+      rAFRef.current = null;
+      isLoopRunning.current = false;
     };
   }, [containerRef, prefersReducedMotion, startAnimationLoop, drawFrame, getStageAndFrameFromProgress]);
 

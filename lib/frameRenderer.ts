@@ -1,8 +1,8 @@
-﻿/**
+/**
  * frameRenderer.ts
  *
  * Canvas-based frame renderer with cover-fit math, devicePixelRatio awareness,
- * and high-performance preloading with HTMLImageElement.decode().
+ * Frames arrive as ImageBitmaps from lib/frameStore.
  */
 
 export interface CoverRect {
@@ -79,16 +79,16 @@ export function syncCanvasSize(
 export function renderFrameToCanvas(
   canvas: HTMLCanvasElement,
   context: CanvasRenderingContext2D,
-  img: HTMLImageElement
+  img: ImageBitmap
 ): void {
-  if (!img || img.naturalWidth === 0) return;
+  if (!img || img.width === 0) return;
 
   const rect = canvas.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return;
 
   syncCanvasSize(canvas, context);
 
-  const cover = calculateCoverFit(img.naturalWidth, img.naturalHeight, rect.width, rect.height);
+  const cover = calculateCoverFit(img.width, img.height, rect.width, rect.height);
 
   context.clearRect(0, 0, rect.width, rect.height);
   context.drawImage(img, cover.dx, cover.dy, cover.dWidth, cover.dHeight);
@@ -106,20 +106,4 @@ export function formatFrameNumber(index: number): string {
  */
 export function getFrameUrl(folderPath: string, frameNumber: number): string {
   return `${folderPath}/frame_${formatFrameNumber(frameNumber)}.webp`;
-}
-
-/**
- * Load a single image with async decode()
- */
-export async function loadFrameImage(url: string): Promise<HTMLImageElement> {
-  const img = new Image();
-  img.src = url;
-  try {
-    if ("decode" in img) {
-      await img.decode();
-    }
-  } catch {
-    // Decoding error or aborted, image element will still fallback on onload
-  }
-  return img;
 }
